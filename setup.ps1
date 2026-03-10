@@ -243,31 +243,163 @@ function Initialize-Dirs {
 # ============================================================
 # 4. 拉取镜像并启动
 # ============================================================
+function Repair-OpenClawConfig {
+    param([string]$ConfigPath, [string]$GwPort, [string]$EnvFile)
+
+    if (-not (Test-Path $ConfigPath)) { return }
+
+    $config = Get-Content $ConfigPath -Raw | ConvertFrom-Json
+
+    # 确保 gateway 和 controlUi 节点存在
+    if (-not $config.gateway) { $config | Add-Member -NotePropertyName "gateway" -NotePropertyValue ([PSCustomObject]@{}) }
+    $gw = $config.gateway
+    if (-not $gw.controlUi) { $gw | Add-Member -NotePropertyName "controlUi" -NotePropertyValue ([PSCustomObject]@{}) }
+    $ui = $gw.controlUi
+
+    # 1. 修复 allowedOrigins
+    $origins = @("http://localhost", "http://localhost:$GwPort", "http://127.0.0.1", "http://127.0.0.1:$GwPort")
+    if ($ui.PSObject.Properties["allowedOrigins"]) {
+        $ui.allowedOrigins = $origins
+    } else {
+        $ui | Add-Member -NotePropertyName "allowedOrigins" -NotePropertyValue $origins
+    }
+
+    # allowInsecureAuth + dangerouslyDisableDeviceAuth
+    foreach ($prop in @("allowInsecureAuth", "dangerouslyDisableDeviceAuth")) {
+        if ($ui.PSObject.Properties[$prop]) {
+            $ui.$prop = $true
+        } else {
+            $ui | Add-Member -NotePropertyName $prop -NotePropertyValue $true
+        }
+    }
+    Write-Ok "allowedOrigins + disableDeviceAuth"
+
+    # 2. trustedProxies
+    $proxies = @("172.16.0.0/12", "192.168.0.0/16", "127.0.0.1/32")
+    if ($gw.PSObject.Properties["trustedProxies"]) {
+        $gw.trustedProxies = $proxies
+    } else {
+        $gw | Add-Member -NotePropertyName "trustedProxies" -NotePropertyValue $proxies
+    }
+    Write-Ok "trustedProxies"
+
+    # 3. 清理过期 feishu-openclaw-plugin
+    if ($config.plugins -and $config.plugins.entries -and $config.plugins.entries.PSObject.Properties["feishu-openclaw-plugin"]) {
+        $config.plugins.entries.PSObject.Properties.Remove("feishu-openclaw-plugin")
+        Write-Ok "清理过期条目 feishu-openclaw-plugin"
+    }
+
+    # 4. 根据 .env 启用 IM 插件
+    if (Test-Path $EnvFile) {
+        $envVars = @{}
+        Get-Content $EnvFile | ForEach-Object {
+            if ($_ -match "^([^#][^=]+)=(.*)$") { $envVars[$Matches[1]] = $Matches[2] }
+        }
+        if (-not $config.plugins) { $config | Add-Member -NotePropertyName "plugins" -NotePropertyValue ([PSCustomObject]@{}) }
+        if (-not $config.plugins.entries) { $config.plugins | Add-Member -NotePropertyName "entries" -NotePropertyValue ([PSCustomObject]@{}) }
+        $entries = $config.plugins.entries
+
+        $imMap = @{
+            "DINGTALK_CLIENT_ID" = "dingtalk"
+            "QQBOT_APP_ID" = "qqbot"
+            "NAPCAT_REVERSE_WS_PORT" = "qq"
+            "WECOM_TOKEN" = "wecom"
+        }
+        foreach ($envKey in $imMap.Keys) {
+            $pluginId = $imMap[$envKey]
+            if ($envVars[$envKey]) {
+                if (-not $entries.PSObject.Properties[$pluginId]) {
+                    $entries | Add-Member -NotePropertyName $pluginId -NotePropertyValue ([PSCustomObject]@{ enabled = $true })
+                } else {
+                    $entries.$pluginId | Add-Member -NotePropertyName "enabled" -NotePropertyValue $true -Force
+                }
+                Write-Ok "启用插件: $pluginId"
+            }
+        }
+    }
+
+    $config | ConvertTo-Json -Depth 20 | Set-Content $ConfigPath -Encoding UTF8
+    Write-Ok "配置已保存"
+}
+
 function Start-Service {
     Write-Info "拉取 Docker 镜像（首次可能需要几分钟）..."
     Set-Location $ScriptDir
     docker compose pull openclaw-gateway
 
+    # 确保没有残留容器
+    docker compose down 2>$null
+
     Write-Info "启动 OpenClaw..."
     docker compose up -d openclaw-gateway
 
     Write-Host ""
+    Write-Info "等待服务初始化（首次约 15 秒）..."
+    Start-Sleep -Seconds 12
+
+    $envFile = Join-Path $ScriptDir ".env"
+    $gwPort = "18789"
+    $portMatch = Select-String -Path $envFile -Pattern "^OPENCLAW_GATEWAY_PORT=(.+)$"
+    if ($portMatch) { $gwPort = $portMatch.Matches.Groups[1].Value }
+
+    $configPath = Join-Path $DataDir "openclaw.json"
+
+    # ---- 修复 1: 插件 ownership ----
+    Write-Info "修复插件权限..."
+    docker exec openclaw-gateway chown -R root:root /home/node/.openclaw/extensions/ 2>$null
+    Write-Ok "插件权限已修复"
+
+    # ---- 修复 2: openclaw.json 配置 ----
+    Write-Info "修复控制面板和插件配置..."
+    Repair-OpenClawConfig -ConfigPath $configPath -GwPort $gwPort -EnvFile $envFile
+
+    # 重启让修改生效
+    Write-Info "重启服务使配置生效..."
+    docker compose restart openclaw-gateway
+    Start-Sleep -Seconds 5
+
     Write-Info "等待服务就绪..."
     $retries = 0
     while ($retries -lt 30) {
         try {
-            $response = Invoke-WebRequest -Uri "http://127.0.0.1:18789/healthz" -UseBasicParsing -TimeoutSec 2 -ErrorAction Stop
+            $response = Invoke-WebRequest -Uri "http://127.0.0.1:${gwPort}/healthz" -UseBasicParsing -TimeoutSec 2 -ErrorAction Stop
             if ($response.StatusCode -eq 200) {
                 Write-Host ""
+
+                # 自动批准内部 agent 的设备配对
+                Write-Info "批准内部设备配对..."
+                $approveResult = docker exec openclaw-gateway openclaw devices approve --latest 2>&1
+                if ($LASTEXITCODE -eq 0) {
+                    Write-Ok "设备配对已批准"
+                } else {
+                    Write-Warn "无待批准的配对请求（可忽略）"
+                }
+
+                # 清理重启后重新生成的过期插件条目
+                if (Test-Path $configPath) {
+                    $cfg = Get-Content $configPath -Raw | ConvertFrom-Json
+                    if ($cfg.plugins -and $cfg.plugins.entries -and $cfg.plugins.entries.PSObject.Properties["feishu-openclaw-plugin"]) {
+                        $cfg.plugins.entries.PSObject.Properties.Remove("feishu-openclaw-plugin")
+                        $cfg | ConvertTo-Json -Depth 20 | Set-Content $configPath -Encoding UTF8
+                        Write-Ok "清理过期条目 feishu-openclaw-plugin"
+                    }
+                }
+
                 Write-Ok "OpenClaw 已成功启动！"
                 Write-Host ""
+
+                $token = (Select-String -Path $envFile -Pattern "^OPENCLAW_GATEWAY_TOKEN=(.+)$").Matches.Groups[1].Value
+                $url = "http://127.0.0.1:${gwPort}/overview?token=$token"
+
                 Write-Host "========================================" -ForegroundColor Green
                 Write-Host "  部署完成！" -ForegroundColor Green
                 Write-Host "========================================" -ForegroundColor Green
                 Write-Host ""
-                Write-Host "  控制面板: http://127.0.0.1:18789/"
-                $token = (Select-String -Path (Join-Path $ScriptDir ".env") -Pattern "^OPENCLAW_GATEWAY_TOKEN=(.+)$").Matches.Groups[1].Value
-                Write-Host "  Gateway Token: $token"
+                Write-Host "  打开以下链接，自动连接控制面板（token 已内置）："
+                Write-Host ""
+                Write-Host "    $url" -ForegroundColor Yellow
+                Write-Host ""
+                Write-Host "  提示: 首次打开后 token 会保存到浏览器，后续直接访问即可" -ForegroundColor Cyan
                 Write-Host ""
                 Write-Host "  常用命令："
                 Write-Host "    查看日志:  docker compose logs -f"
