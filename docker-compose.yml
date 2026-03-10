@@ -1,0 +1,117 @@
+x-openclaw-common-env: &openclaw-common-env
+  TZ: Asia/Shanghai
+  HOME: /home/node
+  TERM: xterm-256color
+  # 模型配置
+  SYNC_MODEL_CONFIG: ${SYNC_MODEL_CONFIG}
+  MODEL_ID: ${MODEL_ID}
+  IMAGE_MODEL_ID: ${IMAGE_MODEL_ID:-}
+  BASE_URL: ${BASE_URL}
+  API_KEY: ${API_KEY}
+  API_PROTOCOL: ${API_PROTOCOL}
+  CONTEXT_WINDOW: ${CONTEXT_WINDOW}
+  MAX_TOKENS: ${MAX_TOKENS}
+  # 提供商 2 (可选，给默认空值避免 WARN)
+  MODEL2_NAME: ${MODEL2_NAME:-}
+  MODEL2_MODEL_ID: ${MODEL2_MODEL_ID:-}
+  MODEL2_BASE_URL: ${MODEL2_BASE_URL:-}
+  MODEL2_API_KEY: ${MODEL2_API_KEY:-}
+  MODEL2_PROTOCOL: ${MODEL2_PROTOCOL:-}
+  MODEL2_CONTEXT_WINDOW: ${MODEL2_CONTEXT_WINDOW:-}
+  MODEL2_MAX_TOKENS: ${MODEL2_MAX_TOKENS:-}
+  # 渠道通用配置
+  DM_POLICY: ${DM_POLICY}
+  GROUP_POLICY: ${GROUP_POLICY}
+  ALLOW_FROM: ${ALLOW_FROM}
+  # Telegram
+  TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+  # 飞书
+  FEISHU_APP_ID: ${FEISHU_APP_ID:-}
+  FEISHU_APP_SECRET: ${FEISHU_APP_SECRET:-}
+  FEISHU_STREAMING: ${FEISHU_STREAMING:-true}
+  FEISHU_FOOTER_ELAPSED: ${FEISHU_FOOTER_ELAPSED:-true}
+  FEISHU_FOOTER_STATUS: ${FEISHU_FOOTER_STATUS:-true}
+  FEISHU_REQUIRE_MENTION: ${FEISHU_REQUIRE_MENTION:-true}
+  # 钉钉
+  DINGTALK_CLIENT_ID: ${DINGTALK_CLIENT_ID:-}
+  DINGTALK_CLIENT_SECRET: ${DINGTALK_CLIENT_SECRET:-}
+  DINGTALK_ROBOT_CODE: ${DINGTALK_ROBOT_CODE:-}
+  DINGTALK_CORP_ID: ${DINGTALK_CORP_ID:-}
+  DINGTALK_AGENT_ID: ${DINGTALK_AGENT_ID:-}
+  # QQ 机器人
+  QQBOT_APP_ID: ${QQBOT_APP_ID:-}
+  QQBOT_CLIENT_SECRET: ${QQBOT_CLIENT_SECRET:-}
+  NAPCAT_REVERSE_WS_PORT: ${NAPCAT_REVERSE_WS_PORT:-}
+  NAPCAT_HTTP_URL: ${NAPCAT_HTTP_URL:-}
+  NAPCAT_ACCESS_TOKEN: ${NAPCAT_ACCESS_TOKEN:-}
+  NAPCAT_ADMINS: ${NAPCAT_ADMINS:-}
+  # 企业微信
+  WECOM_TOKEN: ${WECOM_TOKEN:-}
+  WECOM_ENCODING_AES_KEY: ${WECOM_ENCODING_AES_KEY:-}
+  WECOM_BOTS_JSON: ${WECOM_BOTS_JSON:-}
+  # 工作空间
+  WORKSPACE: ${WORKSPACE}
+  # Gateway 配置
+  OPENCLAW_GATEWAY_TOKEN: ${OPENCLAW_GATEWAY_TOKEN}
+  OPENCLAW_GATEWAY_BIND: ${OPENCLAW_GATEWAY_BIND}
+  OPENCLAW_GATEWAY_PORT: ${OPENCLAW_GATEWAY_PORT}
+  OPENCLAW_BRIDGE_PORT: ${OPENCLAW_BRIDGE_PORT}
+  OPENCLAW_GATEWAY_MODE: ${OPENCLAW_GATEWAY_MODE}
+  OPENCLAW_GATEWAY_ALLOWED_ORIGINS: ${OPENCLAW_GATEWAY_ALLOWED_ORIGINS}
+  OPENCLAW_GATEWAY_ALLOW_INSECURE_AUTH: ${OPENCLAW_GATEWAY_ALLOW_INSECURE_AUTH}
+  OPENCLAW_GATEWAY_DANGEROUSLY_DISABLE_DEVICE_AUTH: ${OPENCLAW_GATEWAY_DANGEROUSLY_DISABLE_DEVICE_AUTH}
+  OPENCLAW_GATEWAY_AUTH_MODE: ${OPENCLAW_GATEWAY_AUTH_MODE:-}
+  # 插件控制
+  OPENCLAW_PLUGINS_ENABLED: ${OPENCLAW_PLUGINS_ENABLED}
+  FEISHU_OFFICIAL_PLUGIN_ENABLED: ${FEISHU_OFFICIAL_PLUGIN_ENABLED:-}
+
+services:
+  openclaw-gateway:
+    container_name: openclaw-gateway
+    image: ${OPENCLAW_IMAGE}
+    cap_add:
+      - CHOWN
+      - SETUID
+      - SETGID
+      - DAC_OVERRIDE
+    user: ${OPENCLAW_RUN_USER:-0:0}
+    environment: *openclaw-common-env
+    volumes:
+      - ${OPENCLAW_DATA_DIR}:/home/node/.openclaw
+      - openclaw-extensions:/home/node/.openclaw/extensions
+    ports:
+      - "${OPENCLAW_GATEWAY_PORT}:18789"
+      - "${OPENCLAW_BRIDGE_PORT}:18790"
+    init: true
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:18789/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+  openclaw-installer:
+    container_name: openclaw-installer
+    image: ${OPENCLAW_IMAGE}
+    profiles:
+      - tools
+    user: ${OPENCLAW_RUN_USER:-0:0}
+    environment: *openclaw-common-env
+    volumes:
+      - ${OPENCLAW_DATA_DIR}:/home/node/.openclaw
+      - openclaw-extensions:/home/node/.openclaw/extensions
+    entrypoint: ["tail", "-f", "/dev/null"]
+    init: true
+    restart: 'no'
+    ports: []
+    stdin_open: true
+    tty: true
+    cap_add:
+      - CHOWN
+      - SETUID
+      - SETGID
+      - DAC_OVERRIDE
+
+volumes:
+  openclaw-extensions:
