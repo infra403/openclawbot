@@ -4,14 +4,14 @@
 # ============================================================
 #Requires -Version 5.1
 
-$ErrorActionPreference = "Stop"
+$ErrorActionPreference = "Continue"
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
-$DataDir = "$env:USERPROFILE\.openclaw"
+$DataDir = Join-Path $env:USERPROFILE ".openclaw"
 
-function Write-Info  { Write-Host "[INFO] $args" -ForegroundColor Cyan }
-function Write-Ok    { Write-Host "[OK] $args" -ForegroundColor Green }
-function Write-Warn  { Write-Host "[WARN] $args" -ForegroundColor Yellow }
-function Write-Err   { Write-Host "[ERROR] $args" -ForegroundColor Red }
+function Write-Info  { param([string]$Message) Write-Host "[INFO] $Message" -ForegroundColor Cyan }
+function Write-Ok    { param([string]$Message) Write-Host "[OK] $Message" -ForegroundColor Green }
+function Write-Warn  { param([string]$Message) Write-Host "[WARN] $Message" -ForegroundColor Yellow }
+function Write-Err   { param([string]$Message) Write-Host "[ERROR] $Message" -ForegroundColor Red }
 
 # ============================================================
 # 1. 环境检查
@@ -20,32 +20,30 @@ function Test-Prerequisites {
     Write-Info "检查运行环境..."
 
     # Docker
-    try {
-        $dockerVersion = docker --version
-        Write-Ok "Docker $dockerVersion"
-    } catch {
+    $dockerPath = Get-Command docker -ErrorAction SilentlyContinue
+    if (-not $dockerPath) {
         Write-Err "未找到 Docker，请安装 Docker Desktop for Windows:"
         Write-Host "  https://docs.docker.com/desktop/install/windows-install/"
         exit 1
     }
+    $dockerVersion = & docker --version 2>&1
+    Write-Ok "Docker $dockerVersion"
 
     # Docker Compose
-    try {
-        $composeVersion = docker compose version --short
-        Write-Ok "Docker Compose $composeVersion"
-    } catch {
+    $composeVersion = & docker compose version --short 2>&1
+    if ($LASTEXITCODE -ne 0) {
         Write-Err "Docker Compose 不可用，请确保 Docker Desktop 已安装"
         exit 1
     }
+    Write-Ok "Docker Compose $composeVersion"
 
     # Docker daemon
-    try {
-        docker info 2>$null | Out-Null
-        Write-Ok "Docker 守护进程运行中"
-    } catch {
+    & docker info 2>&1 | Out-Null
+    if ($LASTEXITCODE -ne 0) {
         Write-Err "Docker 守护进程未运行，请启动 Docker Desktop"
         exit 1
     }
+    Write-Ok "Docker 守护进程运行中"
 
     # 内存检查
     $totalMem = [math]::Round((Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory / 1GB)
@@ -134,22 +132,37 @@ function Initialize-Env {
         exit 1
     }
 
-    # 读取并替换
-    $content = Get-Content $envFile -Raw
-    $content = $content -replace "(?m)^API_PROTOCOL=.*$", "API_PROTOCOL=$protocol"
-    $content = $content -replace "(?m)^MODEL_ID=.*$", "MODEL_ID=$modelId"
-    $content = $content -replace "(?m)^BASE_URL=.*$", "BASE_URL=$baseUrl"
-    $content = $content -replace "(?m)^API_KEY=.*$", "API_KEY=$apiKey"
+    # 逐行读取并替换（避免 regex 转义问题）
+    $lines = Get-Content $envFile
+    $newLines = @()
+    foreach ($line in $lines) {
+        if ($line -match "^API_PROTOCOL=") { $newLines += "API_PROTOCOL=$protocol" }
+        elseif ($line -match "^MODEL_ID=") { $newLines += "MODEL_ID=$modelId" }
+        elseif ($line -match "^BASE_URL=") { $newLines += "BASE_URL=$baseUrl" }
+        elseif ($line -match "^API_KEY=") { $newLines += "API_KEY=$apiKey" }
+        elseif ($line -match "^OPENCLAW_GATEWAY_TOKEN=") { $newLines += "OPENCLAW_GATEWAY_TOKEN=$gwToken" }
+        elseif ($line -match "^OPENCLAW_DATA_DIR=") { $newLines += "OPENCLAW_DATA_DIR=$DataDir" }
+        else { $newLines += $line }
+    }
 
-    # Gateway Token
+    # Gateway Token（兼容 PS 5.1）
+    $rng = New-Object System.Security.Cryptography.RNGCryptoServiceProvider
     $bytes = New-Object byte[] 16
-    [System.Security.Cryptography.RandomNumberGenerator]::Fill($bytes)
+    $rng.GetBytes($bytes)
+    $rng.Dispose()
     $gwToken = "oc-" + [BitConverter]::ToString($bytes).Replace("-","").ToLower()
-    $content = $content -replace "(?m)^OPENCLAW_GATEWAY_TOKEN=.*$", "OPENCLAW_GATEWAY_TOKEN=$gwToken"
-    Write-Ok "已生成 Gateway Token: $gwToken"
 
-    # Windows 数据目录
-    $content = $content -replace "(?m)^OPENCLAW_DATA_DIR=.*$", "OPENCLAW_DATA_DIR=$DataDir"
+    # 再替换 token 行（上面循环时 $gwToken 还没生成，这里修正）
+    $finalLines = @()
+    foreach ($line in $newLines) {
+        if ($line -match "^OPENCLAW_GATEWAY_TOKEN=") {
+            $finalLines += "OPENCLAW_GATEWAY_TOKEN=$gwToken"
+        } else {
+            $finalLines += $line
+        }
+    }
+
+    Write-Ok "已生成 Gateway Token: $gwToken"
 
     # IM 平台配置
     Write-Host ""
@@ -160,8 +173,11 @@ function Initialize-Env {
     if ($enableFeishu -eq "y" -or $enableFeishu -eq "Y") {
         $feishuAppId = Read-Host "  飞书 App ID"
         $feishuSecret = Read-Host "  飞书 App Secret"
-        $content = $content -replace "(?m)^FEISHU_APP_ID=.*$", "FEISHU_APP_ID=$feishuAppId"
-        $content = $content -replace "(?m)^FEISHU_APP_SECRET=.*$", "FEISHU_APP_SECRET=$feishuSecret"
+        $finalLines = $finalLines | ForEach-Object {
+            if ($_ -match "^FEISHU_APP_ID=") { "FEISHU_APP_ID=$feishuAppId" }
+            elseif ($_ -match "^FEISHU_APP_SECRET=") { "FEISHU_APP_SECRET=$feishuSecret" }
+            else { $_ }
+        }
         Write-Ok "飞书已配置"
     }
 
@@ -173,11 +189,14 @@ function Initialize-Env {
         $dtRobot = Read-Host "  钉钉 Robot Code"
         $dtCorp = Read-Host "  钉钉 Corp ID (可选)"
         $dtAgent = Read-Host "  钉钉 Agent ID (可选)"
-        $content = $content -replace "(?m)^DINGTALK_CLIENT_ID=.*$", "DINGTALK_CLIENT_ID=$dtClientId"
-        $content = $content -replace "(?m)^DINGTALK_CLIENT_SECRET=.*$", "DINGTALK_CLIENT_SECRET=$dtSecret"
-        $content = $content -replace "(?m)^DINGTALK_ROBOT_CODE=.*$", "DINGTALK_ROBOT_CODE=$dtRobot"
-        $content = $content -replace "(?m)^DINGTALK_CORP_ID=.*$", "DINGTALK_CORP_ID=$dtCorp"
-        $content = $content -replace "(?m)^DINGTALK_AGENT_ID=.*$", "DINGTALK_AGENT_ID=$dtAgent"
+        $finalLines = $finalLines | ForEach-Object {
+            if ($_ -match "^DINGTALK_CLIENT_ID=") { "DINGTALK_CLIENT_ID=$dtClientId" }
+            elseif ($_ -match "^DINGTALK_CLIENT_SECRET=") { "DINGTALK_CLIENT_SECRET=$dtSecret" }
+            elseif ($_ -match "^DINGTALK_ROBOT_CODE=") { "DINGTALK_ROBOT_CODE=$dtRobot" }
+            elseif ($_ -match "^DINGTALK_CORP_ID=") { "DINGTALK_CORP_ID=$dtCorp" }
+            elseif ($_ -match "^DINGTALK_AGENT_ID=") { "DINGTALK_AGENT_ID=$dtAgent" }
+            else { $_ }
+        }
         Write-Ok "钉钉已配置"
     }
 
@@ -193,15 +212,21 @@ function Initialize-Env {
             $napHttp = Read-Host "  NapCat HTTP URL (可选)"
             $napToken = Read-Host "  NapCat Access Token"
             $napAdmins = Read-Host "  管理员 QQ 号（多个逗号分隔）"
-            $content = $content -replace "(?m)^NAPCAT_REVERSE_WS_PORT=.*$", "NAPCAT_REVERSE_WS_PORT=$napPort"
-            $content = $content -replace "(?m)^NAPCAT_HTTP_URL=.*$", "NAPCAT_HTTP_URL=$napHttp"
-            $content = $content -replace "(?m)^NAPCAT_ACCESS_TOKEN=.*$", "NAPCAT_ACCESS_TOKEN=$napToken"
-            $content = $content -replace "(?m)^NAPCAT_ADMINS=.*$", "NAPCAT_ADMINS=$napAdmins"
+            $finalLines = $finalLines | ForEach-Object {
+                if ($_ -match "^NAPCAT_REVERSE_WS_PORT=") { "NAPCAT_REVERSE_WS_PORT=$napPort" }
+                elseif ($_ -match "^NAPCAT_HTTP_URL=") { "NAPCAT_HTTP_URL=$napHttp" }
+                elseif ($_ -match "^NAPCAT_ACCESS_TOKEN=") { "NAPCAT_ACCESS_TOKEN=$napToken" }
+                elseif ($_ -match "^NAPCAT_ADMINS=") { "NAPCAT_ADMINS=$napAdmins" }
+                else { $_ }
+            }
         } else {
             $qqAppId = Read-Host "  QQ Bot App ID"
             $qqSecret = Read-Host "  QQ Bot Client Secret"
-            $content = $content -replace "(?m)^QQBOT_APP_ID=.*$", "QQBOT_APP_ID=$qqAppId"
-            $content = $content -replace "(?m)^QQBOT_CLIENT_SECRET=.*$", "QQBOT_CLIENT_SECRET=$qqSecret"
+            $finalLines = $finalLines | ForEach-Object {
+                if ($_ -match "^QQBOT_APP_ID=") { "QQBOT_APP_ID=$qqAppId" }
+                elseif ($_ -match "^QQBOT_CLIENT_SECRET=") { "QQBOT_CLIENT_SECRET=$qqSecret" }
+                else { $_ }
+            }
         }
         Write-Ok "QQ 机器人已配置"
     }
@@ -211,8 +236,11 @@ function Initialize-Env {
     if ($enableWecom -eq "y" -or $enableWecom -eq "Y") {
         $wecomToken = Read-Host "  企业微信 Token"
         $wecomAes = Read-Host "  企业微信 EncodingAESKey"
-        $content = $content -replace "(?m)^WECOM_TOKEN=.*$", "WECOM_TOKEN=$wecomToken"
-        $content = $content -replace "(?m)^WECOM_ENCODING_AES_KEY=.*$", "WECOM_ENCODING_AES_KEY=$wecomAes"
+        $finalLines = $finalLines | ForEach-Object {
+            if ($_ -match "^WECOM_TOKEN=") { "WECOM_TOKEN=$wecomToken" }
+            elseif ($_ -match "^WECOM_ENCODING_AES_KEY=") { "WECOM_ENCODING_AES_KEY=$wecomAes" }
+            else { $_ }
+        }
         Write-Ok "企业微信已配置"
     }
 
@@ -220,13 +248,16 @@ function Initialize-Env {
     $enableTG = Read-Host "启用 Telegram？(y/N)"
     if ($enableTG -eq "y" -or $enableTG -eq "Y") {
         $tgToken = Read-Host "  Telegram Bot Token"
-        $content = $content -replace "(?m)^TELEGRAM_BOT_TOKEN=.*$", "TELEGRAM_BOT_TOKEN=$tgToken"
+        $finalLines = $finalLines | ForEach-Object {
+            if ($_ -match "^TELEGRAM_BOT_TOKEN=") { "TELEGRAM_BOT_TOKEN=$tgToken" }
+            else { $_ }
+        }
         Write-Ok "Telegram 已配置"
     }
 
-    Set-Content $envFile $content -NoNewline
+    $finalLines | Set-Content $envFile -Encoding UTF8
     Write-Host ""
-    Write-Ok "配置完成！.env 已保存"
+    Write-Ok "配置完成！.env 已保存到 $envFile"
 }
 
 # ============================================================
@@ -241,46 +272,46 @@ function Initialize-Dirs {
 }
 
 # ============================================================
-# 4. 拉取镜像并启动
+# 辅助: 安全地给 PSObject 设置属性
+# ============================================================
+function Set-JsonProperty {
+    param($Object, [string]$Name, $Value)
+    if ($Object.PSObject.Properties[$Name]) {
+        $Object.$Name = $Value
+    } else {
+        $Object | Add-Member -NotePropertyName $Name -NotePropertyValue $Value
+    }
+}
+
+# ============================================================
+# 辅助: 修复 openclaw.json
 # ============================================================
 function Repair-OpenClawConfig {
     param([string]$ConfigPath, [string]$GwPort, [string]$EnvFile)
 
-    if (-not (Test-Path $ConfigPath)) { return }
+    if (-not (Test-Path $ConfigPath)) {
+        Write-Warn "配置文件不存在，跳过修复"
+        return
+    }
 
     $config = Get-Content $ConfigPath -Raw | ConvertFrom-Json
 
     # 确保 gateway 和 controlUi 节点存在
-    if (-not $config.gateway) { $config | Add-Member -NotePropertyName "gateway" -NotePropertyValue ([PSCustomObject]@{}) }
+    if (-not $config.gateway) { Set-JsonProperty $config "gateway" ([PSCustomObject]@{}) }
     $gw = $config.gateway
-    if (-not $gw.controlUi) { $gw | Add-Member -NotePropertyName "controlUi" -NotePropertyValue ([PSCustomObject]@{}) }
+    if (-not $gw.controlUi) { Set-JsonProperty $gw "controlUi" ([PSCustomObject]@{}) }
     $ui = $gw.controlUi
 
     # 1. 修复 allowedOrigins
     $origins = @("http://localhost", "http://localhost:$GwPort", "http://127.0.0.1", "http://127.0.0.1:$GwPort")
-    if ($ui.PSObject.Properties["allowedOrigins"]) {
-        $ui.allowedOrigins = $origins
-    } else {
-        $ui | Add-Member -NotePropertyName "allowedOrigins" -NotePropertyValue $origins
-    }
-
-    # allowInsecureAuth + dangerouslyDisableDeviceAuth
-    foreach ($prop in @("allowInsecureAuth", "dangerouslyDisableDeviceAuth")) {
-        if ($ui.PSObject.Properties[$prop]) {
-            $ui.$prop = $true
-        } else {
-            $ui | Add-Member -NotePropertyName $prop -NotePropertyValue $true
-        }
-    }
+    Set-JsonProperty $ui "allowedOrigins" $origins
+    Set-JsonProperty $ui "allowInsecureAuth" $true
+    Set-JsonProperty $ui "dangerouslyDisableDeviceAuth" $true
     Write-Ok "allowedOrigins + disableDeviceAuth"
 
     # 2. trustedProxies
     $proxies = @("172.16.0.0/12", "192.168.0.0/16", "127.0.0.1/32")
-    if ($gw.PSObject.Properties["trustedProxies"]) {
-        $gw.trustedProxies = $proxies
-    } else {
-        $gw | Add-Member -NotePropertyName "trustedProxies" -NotePropertyValue $proxies
-    }
+    Set-JsonProperty $gw "trustedProxies" $proxies
     Write-Ok "trustedProxies"
 
     # 3. 清理过期 feishu-openclaw-plugin
@@ -293,25 +324,28 @@ function Repair-OpenClawConfig {
     if (Test-Path $EnvFile) {
         $envVars = @{}
         Get-Content $EnvFile | ForEach-Object {
-            if ($_ -match "^([^#][^=]+)=(.*)$") { $envVars[$Matches[1]] = $Matches[2] }
+            if ($_ -match "^([^#][^=]+)=(.+)$") {
+                $envVars[$Matches[1].Trim()] = $Matches[2].Trim()
+            }
         }
-        if (-not $config.plugins) { $config | Add-Member -NotePropertyName "plugins" -NotePropertyValue ([PSCustomObject]@{}) }
-        if (-not $config.plugins.entries) { $config.plugins | Add-Member -NotePropertyName "entries" -NotePropertyValue ([PSCustomObject]@{}) }
+
+        if (-not $config.plugins) { Set-JsonProperty $config "plugins" ([PSCustomObject]@{}) }
+        if (-not $config.plugins.entries) { Set-JsonProperty $config.plugins "entries" ([PSCustomObject]@{}) }
         $entries = $config.plugins.entries
 
         $imMap = @{
-            "DINGTALK_CLIENT_ID" = "dingtalk"
-            "QQBOT_APP_ID" = "qqbot"
+            "DINGTALK_CLIENT_ID"    = "dingtalk"
+            "QQBOT_APP_ID"          = "qqbot"
             "NAPCAT_REVERSE_WS_PORT" = "qq"
-            "WECOM_TOKEN" = "wecom"
+            "WECOM_TOKEN"           = "wecom"
         }
         foreach ($envKey in $imMap.Keys) {
             $pluginId = $imMap[$envKey]
             if ($envVars[$envKey]) {
                 if (-not $entries.PSObject.Properties[$pluginId]) {
-                    $entries | Add-Member -NotePropertyName $pluginId -NotePropertyValue ([PSCustomObject]@{ enabled = $true })
+                    Set-JsonProperty $entries $pluginId ([PSCustomObject]@{ enabled = $true })
                 } else {
-                    $entries.$pluginId | Add-Member -NotePropertyName "enabled" -NotePropertyValue $true -Force
+                    Set-JsonProperty $entries.$pluginId "enabled" $true
                 }
                 Write-Ok "启用插件: $pluginId"
             }
@@ -322,16 +356,19 @@ function Repair-OpenClawConfig {
     Write-Ok "配置已保存"
 }
 
-function Start-Service {
+# ============================================================
+# 4. 拉取镜像并启动
+# ============================================================
+function Start-OpenClaw {
     Write-Info "拉取 Docker 镜像（首次可能需要几分钟）..."
     Set-Location $ScriptDir
-    docker compose pull openclaw-gateway
+    & docker compose pull openclaw-gateway
 
     # 确保没有残留容器
-    docker compose down 2>$null
+    & docker compose down 2>&1 | Out-Null
 
     Write-Info "启动 OpenClaw..."
-    docker compose up -d openclaw-gateway
+    & docker compose up -d openclaw-gateway
 
     Write-Host ""
     Write-Info "等待服务初始化（首次约 15 秒）..."
@@ -339,14 +376,14 @@ function Start-Service {
 
     $envFile = Join-Path $ScriptDir ".env"
     $gwPort = "18789"
-    $portMatch = Select-String -Path $envFile -Pattern "^OPENCLAW_GATEWAY_PORT=(.+)$"
+    $portMatch = Select-String -Path $envFile -Pattern "^OPENCLAW_GATEWAY_PORT=(.+)$" -ErrorAction SilentlyContinue
     if ($portMatch) { $gwPort = $portMatch.Matches.Groups[1].Value }
 
     $configPath = Join-Path $DataDir "openclaw.json"
 
     # ---- 修复 1: 插件 ownership ----
     Write-Info "修复插件权限..."
-    docker exec openclaw-gateway chown -R root:root /home/node/.openclaw/extensions/ 2>$null
+    & docker exec openclaw-gateway chown -R root:root /home/node/.openclaw/extensions/ 2>&1 | Out-Null
     Write-Ok "插件权限已修复"
 
     # ---- 修复 2: openclaw.json 配置 ----
@@ -355,20 +392,20 @@ function Start-Service {
 
     # 重启让修改生效
     Write-Info "重启服务使配置生效..."
-    docker compose restart openclaw-gateway
+    & docker compose restart openclaw-gateway
     Start-Sleep -Seconds 5
 
     Write-Info "等待服务就绪..."
     $retries = 0
     while ($retries -lt 30) {
         try {
-            $response = Invoke-WebRequest -Uri "http://127.0.0.1:${gwPort}/healthz" -UseBasicParsing -TimeoutSec 2 -ErrorAction Stop
+            $response = Invoke-WebRequest -Uri "http://127.0.0.1:$gwPort/healthz" -UseBasicParsing -TimeoutSec 2 -ErrorAction Stop
             if ($response.StatusCode -eq 200) {
                 Write-Host ""
 
                 # 自动批准内部 agent 的设备配对
                 Write-Info "批准内部设备配对..."
-                $approveResult = docker exec openclaw-gateway openclaw devices approve --latest 2>&1
+                & docker exec openclaw-gateway openclaw devices approve --latest 2>&1 | Out-Null
                 if ($LASTEXITCODE -eq 0) {
                     Write-Ok "设备配对已批准"
                 } else {
@@ -377,25 +414,30 @@ function Start-Service {
 
                 # 清理重启后重新生成的过期插件条目
                 if (Test-Path $configPath) {
-                    $cfg = Get-Content $configPath -Raw | ConvertFrom-Json
-                    if ($cfg.plugins -and $cfg.plugins.entries -and $cfg.plugins.entries.PSObject.Properties["feishu-openclaw-plugin"]) {
-                        $cfg.plugins.entries.PSObject.Properties.Remove("feishu-openclaw-plugin")
-                        $cfg | ConvertTo-Json -Depth 20 | Set-Content $configPath -Encoding UTF8
-                        Write-Ok "清理过期条目 feishu-openclaw-plugin"
+                    try {
+                        $cfg = Get-Content $configPath -Raw | ConvertFrom-Json
+                        if ($cfg.plugins -and $cfg.plugins.entries -and $cfg.plugins.entries.PSObject.Properties["feishu-openclaw-plugin"]) {
+                            $cfg.plugins.entries.PSObject.Properties.Remove("feishu-openclaw-plugin")
+                            $cfg | ConvertTo-Json -Depth 20 | Set-Content $configPath -Encoding UTF8
+                            Write-Ok "清理过期条目 feishu-openclaw-plugin"
+                        }
+                    } catch {
+                        Write-Warn "清理过期条目失败（可忽略）"
                     }
                 }
 
                 Write-Ok "OpenClaw 已成功启动！"
                 Write-Host ""
 
-                $token = (Select-String -Path $envFile -Pattern "^OPENCLAW_GATEWAY_TOKEN=(.+)$").Matches.Groups[1].Value
+                $tokenMatch = Select-String -Path $envFile -Pattern "^OPENCLAW_GATEWAY_TOKEN=(.+)$"
+                $token = $tokenMatch.Matches.Groups[1].Value
                 $url = "http://127.0.0.1:${gwPort}/overview?token=$token"
 
                 Write-Host "========================================" -ForegroundColor Green
                 Write-Host "  部署完成！" -ForegroundColor Green
                 Write-Host "========================================" -ForegroundColor Green
                 Write-Host ""
-                Write-Host "  打开以下链接，自动连接控制面板（token 已内置）："
+                Write-Host "  打开以下链接，自动连接控制面板（token 已内置）：" -ForegroundColor White
                 Write-Host ""
                 Write-Host "    $url" -ForegroundColor Yellow
                 Write-Host ""
@@ -416,7 +458,7 @@ function Start-Service {
     }
 
     Write-Warn "服务启动超时，查看日志排查问题："
-    docker compose logs --tail=50 openclaw-gateway
+    & docker compose logs --tail=50 openclaw-gateway
 }
 
 # ============================================================
@@ -435,4 +477,4 @@ Initialize-Env
 Write-Host ""
 Initialize-Dirs
 Write-Host ""
-Start-Service
+Start-OpenClaw
