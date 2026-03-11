@@ -255,7 +255,8 @@ function Initialize-Env {
         Write-Ok "Telegram 已配置"
     }
 
-    $finalLines | Set-Content $envFile -Encoding UTF8
+    $envContent = $finalLines -join "`n"
+    Write-Utf8NoBom -Path $envFile -Content $envContent
     Write-Host ""
     Write-Ok "配置完成！.env 已保存到 $envFile"
 }
@@ -269,6 +270,15 @@ function Initialize-Dirs {
         New-Item -ItemType Directory -Path $DataDir -Force | Out-Null
     }
     Write-Ok "数据目录: $DataDir"
+}
+
+# ============================================================
+# 辅助: 写文件为无 BOM 的 UTF-8（PS 5.1 的 -Encoding UTF8 带 BOM）
+# ============================================================
+function Write-Utf8NoBom {
+    param([string]$Path, [string]$Content)
+    $utf8 = New-Object System.Text.UTF8Encoding($false)
+    [System.IO.File]::WriteAllText($Path, $Content, $utf8)
 }
 
 # ============================================================
@@ -352,7 +362,8 @@ function Repair-OpenClawConfig {
         }
     }
 
-    $config | ConvertTo-Json -Depth 20 | Set-Content $ConfigPath -Encoding UTF8
+    $jsonStr = $config | ConvertTo-Json -Depth 20
+    Write-Utf8NoBom -Path $ConfigPath -Content $jsonStr
     Write-Ok "配置已保存"
 }
 
@@ -418,7 +429,8 @@ function Start-OpenClaw {
                         $cfg = Get-Content $configPath -Raw | ConvertFrom-Json
                         if ($cfg.plugins -and $cfg.plugins.entries -and $cfg.plugins.entries.PSObject.Properties["feishu-openclaw-plugin"]) {
                             $cfg.plugins.entries.PSObject.Properties.Remove("feishu-openclaw-plugin")
-                            $cfg | ConvertTo-Json -Depth 20 | Set-Content $configPath -Encoding UTF8
+                            $cfgJson = $cfg | ConvertTo-Json -Depth 20
+                        Write-Utf8NoBom -Path $configPath -Content $cfgJson
                             Write-Ok "清理过期条目 feishu-openclaw-plugin"
                         }
                     } catch {
